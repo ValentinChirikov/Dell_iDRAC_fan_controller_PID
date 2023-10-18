@@ -1,5 +1,6 @@
 #!/bin/bash
 
+# initially https://github.com/tigerblue77/Dell_iDRAC_fan_controller_Docker
 # Enable strict bash mode to stop the script if an uninitialized variable is used, if a command fails, or if a command with a pipe fails
 # Not working in some setups : https://github.com/tigerblue77/Dell_iDRAC_fan_controller/issues/48
 # set -euo pipefail
@@ -16,8 +17,10 @@ function apply_Dell_fan_control_profile () {
 function apply_user_fan_control_profile () {
   # Use ipmitool to send the raw command to set fan control to user-specified value
   ipmitool -I $IDRAC_LOGIN_STRING raw 0x30 0x30 0x01 0x00 > /dev/null
+  # TODO  ?? is a zero indexed fan number and ## is as above. Fan 1 is 0x00, fan 2 is 0x01, etc.
+  # ipmitool -I $IDRAC_LOGIN_STRING raw 0x30 0x30 0x02 $FAN $HEXADECIMAL_FAN_SPEED > /dev/null
   ipmitool -I $IDRAC_LOGIN_STRING raw 0x30 0x30 0x02 0xff $HEXADECIMAL_FAN_SPEED > /dev/null
-  CURRENT_FAN_CONTROL_PROFILE="User static fan control profile ($DECIMAL_FAN_SPEED%)"
+  CURRENT_FAN_CONTROL_PROFILE="User dynamic fan control profile"
 }
 
 # Retrieve temperature sensors data using ipmitool
@@ -31,14 +34,19 @@ function retrieve_temperatures () {
   local IS_EXHAUST_TEMPERATURE_SENSOR_PRESENT=$1
   local IS_CPU2_TEMPERATURE_SENSOR_PRESENT=$2
 
-  local DATA=$(ipmitool -I $IDRAC_LOGIN_STRING sdr type temperature | grep degrees)
+  local DATA
+  DATA=$(ipmitool -I $IDRAC_LOGIN_STRING sdr type temperature | grep degrees)
 
   # Parse CPU data
-  local CPU_DATA=$(echo "$DATA" | grep "3\." | grep -Po '\d{2}')
+  local CPU_DATA
+  CPU_DATA=$(echo "$DATA" | grep "3\." | grep -Po '\d{2}')
+  
   CPU1_TEMPERATURE=$(echo $CPU_DATA | awk '{print $1;}')
+  CPU_AVG_TEMPERATURE=$CPU1_TEMPERATURE
   if $IS_CPU2_TEMPERATURE_SENSOR_PRESENT
   then
     CPU2_TEMPERATURE=$(echo $CPU_DATA | awk '{print $2;}')
+    CPU_AVG_TEMPERATURE=$(( (CPU1_TEMPERATURE + CPU2_TEMPERATURE) / 2 ))
   else
     CPU2_TEMPERATURE="-"
   fi
@@ -86,15 +94,14 @@ function disable_third_party_PCIe_card_Dell_default_cooling_response () {
 function gracefull_exit () {
   apply_Dell_fan_control_profile
   enable_third_party_PCIe_card_Dell_default_cooling_response
-  echo "/!\ WARNING /!\ Container stopped, Dell default dynamic fan control profile applied for safety."
+  echo "/!\ WARNING /!\ Service stopped, Dell default dynamic fan control profile applied for safety."
   exit 0
 }
 
 # Trap the signals for container exit and run gracefull_exit function
-trap 'gracefull_exit' SIGQUIT SIGKILL SIGTERM
+trap 'gracefull_exit' SIGQUIT SIGTERM SIGINT 
 
 # Prepare, format and define initial variables
-
 # readonly DELL_FRESH_AIR_COMPLIANCE=45
 
 # Check if FAN_SPEED variable is in hexadecimal format. If not, convert it to hexadecimal
@@ -126,7 +133,8 @@ else
 fi
 
 # Log the fan speed objective, CPU temperature threshold and check interval
-echo "Fan speed objective: $DECIMAL_FAN_SPEED%"
+echo "Fan speed initial: $DECIMAL_FAN_SPEED%"
+echo "CPU temperature setpoint: $CPU_TEMPERATURE_SETPOINT°C"
 echo "CPU temperature threshold: $CPU_TEMPERATURE_THRESHOLD°C"
 echo "Check interval: ${CHECK_INTERVAL}s"
 echo ""
@@ -157,6 +165,90 @@ then
   echo ""
 fi
 
+# Define functions to check if CPU 1 and CPU 2 temperatures are above the threshold
+function CPU1_OVERHEAT () { [ $CPU1_TEMPERATURE -gt $CPU_TEMPERATURE_THRESHOLD ]; }
+if $IS_CPU2_TEMPERATURE_SENSOR_PRESENT
+then
+  function CPU2_OVERHEAT () { [ $CPU2_TEMPERATURE -gt $CPU_TEMPERATURE_THRESHOLD ]; }
+fi
+
+p="-500"
+i="-800"
+d="-600"
+target=$CPU_TEMPERATURE_SETPOINT
+output="0"
+currentFeedback="0"
+lastPIDError="0"
+integralCumulation="0"
+maxCumulation="120"
+outputLowerBound="10"
+outputUpperBound="100"
+lastTime=$(date +%s)
+
+function tickPID() {
+# initial C @author Nick Mosher, <codewhisperer97@gmail.com>
+    # sleep 1s;
+    # printf "\n"
+
+    # //Retrieve system feedback from user callback.
+    currentFeedback=$CPU_AVG_TEMPERATURE
+    # echo "currentFeedback $currentFeedback"
+
+    # // Calculate the error between the feedback and the target.
+    PIDerror=$((target - currentFeedback));
+
+    currentTime=$(date +%s)
+    deltaTime=$((currentTime - lastTime))
+    # // Calculate the integral of the feedback data since last cycle.
+    cycleIntegral=$(( ((lastPIDError + PIDerror) / 2) * deltaTime ))
+    # // Add this cycle's integral to the integral cumulation.
+    integralCumulation=$(( integralCumulation + cycleIntegral ))
+    # // Calculate the slope of the line with data from the current and last cycles.
+    cycleDerivative=$(( (PIDerror - lastPIDError) / deltaTime ))
+    # // Save time data for next iteration.
+    lastTime=$currentTime;
+
+    # integralCumulation=$((integralCumulation + PIDerror));
+    # cycleDerivative=$((PIDerror - lastPIDError));
+
+    # // Prevent the integral cumulation from becoming overwhelmingly huge.
+    if [ $integralCumulation -gt $maxCumulation ];
+    then
+        integralCumulation=$maxCumulation
+    fi
+
+    if [ $integralCumulation -lt -$maxCumulation ];
+    then
+        integralCumulation=-$maxCumulation;
+    fi
+
+    # echo "IC: $integralCumulation CD: $cycleDerivative PE: $PIDerror"
+
+    # // Calculate the system output based on data and PID gains.
+    output=$(( ((PIDerror * p) + (integralCumulation * i) + (cycleDerivative * d)) / 1000 ));
+
+    # // Save a record of this iteration's data.
+    # lastFeedback=$currentFeedback;
+
+    lastPIDError=$PIDerror;
+    # echo "LPE: $lastPIDError"
+
+		# // Trim the output to the bounds if needed.
+    if [ $output -gt $outputUpperBound ];
+    then
+        output=$outputUpperBound
+    fi
+    if [ $output -lt $outputLowerBound ];
+    then
+        output=$outputLowerBound
+    fi
+
+    # echo "output bound $output"
+    HEXADECIMAL_FAN_SPEED=$(printf '0x%02x' $output)
+    # echo "LPE: $lastPIDError OUT: $HEXADECIMAL_FAN_SPEED"
+}
+
+
 # Start monitoring
 while true; do
   # Sleep for the specified interval before taking another reading
@@ -164,13 +256,6 @@ while true; do
   SLEEP_PROCESS_PID=$!
 
   retrieve_temperatures $IS_EXHAUST_TEMPERATURE_SENSOR_PRESENT $IS_CPU2_TEMPERATURE_SENSOR_PRESENT
-
-  # Define functions to check if CPU 1 and CPU 2 temperatures are above the threshold
-  function CPU1_OVERHEAT () { [ $CPU1_TEMPERATURE -gt $CPU_TEMPERATURE_THRESHOLD ]; }
-  if $IS_CPU2_TEMPERATURE_SENSOR_PRESENT
-  then
-    function CPU2_OVERHEAT () { [ $CPU2_TEMPERATURE -gt $CPU_TEMPERATURE_THRESHOLD ]; }
-  fi
 
   # Initialize a variable to store the comments displayed when the fan control profile changed
   COMMENT=" -"
@@ -203,6 +288,9 @@ while true; do
       COMMENT="CPU 2 temperature is too high, Dell default dynamic fan control profile applied for safety"
     fi
   else
+
+    # PID Controller
+    tickPID
     apply_user_fan_control_profile
 
     # Check if user fan control profile is applied then apply it if not
